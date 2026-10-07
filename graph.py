@@ -1,101 +1,88 @@
-from typing import TypedDict
+from neo4j import GraphDatabase
+from langchain_core.documents import Document
 
-from langgraph.graph import StateGraph, END
-from langchain_google_genai import ChatGoogleGenerativeAI
-
-from retriever import retrieve
-from config import GOOGLE_API_KEY
-
-
-llm = ChatGoogleGenerativeAI(
-    model="gemini-flash-latest",
-    google_api_key=GOOGLE_API_KEY,
-    temperature=0,
+from config import (
+    NEO4J_URI,
+    NEO4J_USERNAME,
+    NEO4J_PASSWORD,
 )
 
 
-class GraphState(TypedDict):
-    question: str
-    context: str
-    answer: str
+driver = GraphDatabase.driver(
+    NEO4J_URI,
+    auth=(NEO4J_USERNAME, NEO4J_PASSWORD),
+)
 
 
-def retrieve_node(state):
+def graph_search(query: str, limit: int = 4):
+    """
+    Search the Neo4j knowledge graph using concept matching.
+    """
 
-    docs = retrieve(
-        state["question"],
-        k=8,
-    )
+    query_lower = query.lower()
 
-    print("\nQUESTION:", state["question"])
+    with driver.session() as session:
 
-    for i, doc in enumerate(docs, start=1):
-        print("=" * 70)
-        print(
-            f"Chunk {i} | Page {doc.metadata.get('page_label', doc.metadata.get('page'))}"
+        result = session.run(
+            """
+            MATCH (concept:Concept)
+
+            WHERE toLower($search_text) CONTAINS toLower(concept.name)
+               OR toLower(concept.name) CONTAINS toLower($search_text)
+
+            MATCH (chunk:Chunk)-[:MENTIONS]->(concept)
+
+            RETURN DISTINCT
+                chunk.id AS chunk_id,
+                chunk.content AS content,
+                chunk.page AS page,
+                concept.name AS concept
+
+            ORDER BY chunk.page
+
+            LIMIT $limit
+            """,
+            search_text=query_lower,
+            limit=limit,
         )
-        print(doc.page_content[:300])
 
-    context = "\n\n".join(
-        f"Page {doc.metadata.get('page_label', doc.metadata.get('page'))}\n"
-        f"{doc.page_content}"
-        for doc in docs
-    )
+        records = list(result)
 
-    return {
-        "context": context
-    }
+    docs = []
 
+    for record in records:
 
-def generate(state):
+        doc = Document(
+            page_content=record["content"],
+            metadata={
+                "chunk_id": record["chunk_id"],
+                "page": record["page"],
+                "concept": record["concept"],
+                "retrieval": "graph",
+            },
+        )
 
-    prompt = f"""
-You are an AI assistant answering questions from a PDF.
+        docs.append(doc)
 
-Use ONLY the supplied context.
-
-The answer may be spread across multiple chunks.
-
-Combine information from all relevant chunks into one complete answer.
-
-If the answer is not present in the context, reply exactly:
-
-I couldn't find that information in the provided document.
-
-Context
---------
-{state["context"]}
-
-Question
---------
-{state["question"]}
-
-Answer
-"""
-
-    response = llm.invoke(prompt)
-
-    if isinstance(response.content, str):
-        answer = response.content
-    else:
-        answer = ""
-        for part in response.content:
-            if isinstance(part, dict):
-                answer += part.get("text", "")
-
-    return {
-        "answer": answer
-    }
+    return docs
 
 
-builder = StateGraph(GraphState)
+def close_driver():
+    driver.close()
 
-builder.add_node("retrieve", retrieve_node)
-builder.add_node("generate", generate)
 
-builder.set_entry_point("retrieve")
+if __name__ == "__main__":
 
-builder.add_edge("retrieve", "generate")
-builder.add_edge("generate", END)
+    question = input("Enter a question: ")
 
-graph = builder.compile()
+    docs = graph_search(question)
+
+    print(f"\nGraph retrieved {len(docs)} chunks.\n")
+
+    for i, doc in enumerate(docs, 1):
+
+        print(f"--- Graph Result {i} ---")
+        print(f"Concept: {doc.metadata.get('concept')}")
+        print(f"Page: {doc.metadata.get('page')}")
+        print(doc.page_content[:500])
+        print()
