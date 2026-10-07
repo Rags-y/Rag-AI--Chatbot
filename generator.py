@@ -1,6 +1,6 @@
 from langchain_groq import ChatGroq
 
-from hybrid_retriever import hybrid_retrieve
+from neo4j_retriever import neo4j_retrieve
 from config import GROQ_API_KEY
 
 
@@ -13,7 +13,11 @@ llm = ChatGroq(
 
 def generate_answer(question: str):
 
-    docs = hybrid_retrieve(question, k=4)
+    docs = neo4j_retrieve(
+    question,
+    vector_k=4,
+    graph_k=4,
+)
 
     unique_docs = []
     seen_content = set()
