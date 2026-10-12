@@ -53,6 +53,10 @@ const suggestions = [
   },
 ];
 
+
+const API_URL =
+  process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
 export default function Home() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
@@ -64,7 +68,6 @@ export default function Home() {
 
     if (!question || loading) return;
 
-    // Preserve the previous conversation for follow-up questions.
     const previousMessages = messages;
 
     setError("");
@@ -80,7 +83,7 @@ export default function Home() {
     setLoading(true);
 
     try {
-      const response = await fetch("http://127.0.0.1:8000/chat", {
+      const response = await fetch(`${API_URL}/chat`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -93,6 +96,7 @@ export default function Home() {
           })),
         }),
       });
+
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => null);
