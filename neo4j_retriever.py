@@ -57,7 +57,7 @@ def vector_search(query: str, k: int = 4) -> list[Document]:
             node = record["node"]
             score = record["score"]
 
-            text = node.get("text", "")
+            text = node.get("content", "")
 
             metadata = {
                 key: value
@@ -89,7 +89,7 @@ def graph_expand(documents: list[Document]) -> list[Document]:
     cypher_query = """
     MATCH (c:Chunk)-[*1..2]-(related:Chunk)
     WHERE elementId(c) IN $chunk_ids
-      AND related.text IS NOT NULL
+      AND related.content IS NOT NULL
     RETURN DISTINCT related
     LIMIT 10
     """
@@ -129,7 +129,7 @@ def graph_expand(documents: list[Document]) -> list[Document]:
 
         for record in results:
             node = record["related"]
-            text = node.get("text", "")
+            text = node.get("content", "")
 
             if not text or text in seen_texts:
                 continue
