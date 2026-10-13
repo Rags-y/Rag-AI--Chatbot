@@ -152,13 +152,21 @@ def graph_expand(documents: list[Document]) -> list[Document]:
     return expanded_documents
 
 
+
 def neo4j_retrieve(
     query: str,
     k: int = 4,
     vector_k: int | None = None,
+    graph_k: int | None = None,
 ) -> list[Document]:
     if vector_k is not None:
         k = vector_k
 
     documents = vector_search(query, k=k)
-    return graph_expand(documents)
+    expanded_documents = graph_expand(documents)
+
+    if graph_k is not None:
+        return expanded_documents[:graph_k]
+
+    return expanded_documents
+
