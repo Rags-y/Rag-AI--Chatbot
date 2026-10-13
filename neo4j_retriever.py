@@ -1,261 +1,160 @@
-from neo4j import GraphDatabase
+from functools import lru_cache
+
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.documents import Document
 
-from config import (
-    NEO4J_URI,
-    NEO4J_USERNAME,
-    NEO4J_PASSWORD,
-)
+from config import NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD
+
+NEO4J_DATABASE = "64205e56"
+
+from neo4j import GraphDatabase
 
 
+# Neo4j connection
 driver = GraphDatabase.driver(
     NEO4J_URI,
-    auth=(
-        NEO4J_USERNAME,
-        NEO4J_PASSWORD,
-    ),
+    auth=(NEO4J_USERNAME, NEO4J_PASSWORD),
 )
 
 
-embeddings = HuggingFaceEmbeddings(
-    model_name="BAAI/bge-base-en-v1.5",
-    encode_kwargs={
-        "normalize_embeddings": True
-    },
-)
-
-
-def vector_search(
-    query: str,
-    k: int = 4,
-):
-    """
-    Search Neo4j's vector index for the
-    most semantically similar chunks.
-    """
-
-    query_embedding = embeddings.embed_query(
-        query
+# Load the embedding model only when it is first needed.
+# Reuse the same model for subsequent searches.
+@lru_cache(maxsize=1)
+def get_embeddings():
+    return HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True},
     )
 
-    with driver.session() as session:
 
-     records = session.run(
-    """
-    MATCH (node:Chunk)
-    SEARCH node IN (
-        VECTOR INDEX chunk_embedding_index
-        FOR $query_embedding
-        LIMIT $k
+def vector_search(query: str, k: int = 4) -> list[Document]:
+    """Retrieve relevant document chunks using the Neo4j vector index."""
+
+    query_embedding = get_embeddings().embed_query(query)
+
+    cypher_query = """
+    CALL db.index.vector.queryNodes(
+        'chunk_embedding_index',
+        $k,
+        $embedding
     )
-    SCORE AS score
-
-    RETURN
-        node.id AS chunk_id,
-        node.content AS content,
-        node.page AS page,
-        score
-
+    YIELD node, score
+    RETURN node, score
     ORDER BY score DESC
-    """,
-    k=k,
-    query_embedding=query_embedding,
-).data()
+    """
 
-    docs = []
+    documents = []
 
-    for record in records:
-
-        docs.append(
-            Document(
-                page_content=record["content"],
-                metadata={
-                    "chunk_id": record["chunk_id"],
-                    "page": record["page"],
-                    "similarity": record["score"],
-                    "retrieval": "neo4j_vector",
-                },
-            )
+    with driver.session(database=NEO4J_DATABASE) as session:
+        results = session.run(
+            cypher_query,
+            k=k,
+            embedding=query_embedding,
         )
 
-    return docs
+        for record in results:
+            node = record["node"]
+            score = record["score"]
+
+            text = node.get("text", "")
+
+            metadata = {
+                key: value
+                for key, value in dict(node).items()
+                if key not in ("text", "embedding")
+            }
+
+            metadata["similarity"] = score
+
+            documents.append(
+                Document(
+                    page_content=text,
+                    metadata=metadata,
+                )
+            )
+
+    return documents
 
 
-def graph_expand(
-    chunk_ids,
-    limit: int = 4,
-):
-    """
-    Expand vector-retrieved chunks through
-    Neo4j concept relationships.
-    """
+def graph_expand(documents: list[Document]) -> list[Document]:
+    """Expand retrieved chunks using connected nodes in the Neo4j graph."""
 
-    if not chunk_ids:
+    if not documents:
         return []
 
-    with driver.session() as session:
+    expanded_documents = list(documents)
+    seen_texts = {doc.page_content for doc in expanded_documents}
 
-        result = session.run(
-            """
-            MATCH (source:Chunk)-[:MENTIONS]->(concept:Concept)
+    cypher_query = """
+    MATCH (c:Chunk)-[*1..2]-(related:Chunk)
+    WHERE elementId(c) IN $chunk_ids
+      AND related.text IS NOT NULL
+    RETURN DISTINCT related
+    LIMIT 10
+    """
 
-            WHERE source.id IN $chunk_ids
+    chunk_ids = []
 
-            MATCH (related:Chunk)-[:MENTIONS]->(concept)
+    with driver.session(database=NEO4J_DATABASE) as session:
+        for doc in documents:
+            page = doc.metadata.get("page")
+            source = doc.metadata.get("source")
 
-            WHERE NOT related.id IN $chunk_ids
+            if page is None:
+                continue
 
-            WITH
-                related,
-                collect(DISTINCT concept.name) AS shared_concepts
+            results = session.run(
+                """
+                MATCH (c:Chunk)
+                WHERE c.page = $page
+                  AND ($source IS NULL OR c.source = $source)
+                RETURN elementId(c) AS chunk_id
+                LIMIT 1
+                """,
+                page=page,
+                source=source,
+            )
 
-            RETURN
-                related.id AS chunk_id,
-                related.content AS content,
-                related.page AS page,
-                shared_concepts
+            for record in results:
+                chunk_ids.append(record["chunk_id"])
 
-            ORDER BY
-                size(shared_concepts) DESC,
-                related.page
+        if not chunk_ids:
+            return expanded_documents
 
-            LIMIT $limit
-            """,
+        results = session.run(
+            cypher_query,
             chunk_ids=chunk_ids,
-            limit=limit,
         )
 
-        records = list(result)
+        for record in results:
+            node = record["related"]
+            text = node.get("text", "")
 
-    docs = []
+            if not text or text in seen_texts:
+                continue
 
-    for record in records:
+            metadata = {
+                key: value
+                for key, value in dict(node).items()
+                if key not in ("text", "embedding")
+            }
 
-        docs.append(
-            Document(
-                page_content=record["content"],
-                metadata={
-                    "chunk_id": record["chunk_id"],
-                    "page": record["page"],
-                    "concept": ", ".join(
-                        record["shared_concepts"]
-                    ),
-                    "retrieval": "neo4j_graph",
-                },
-            )
-        )
-
-    return docs
-
-
-def neo4j_retrieve(
-    query: str,
-    vector_k: int = 4,
-    graph_k: int = 4,
-):
-    """
-    Neo4j-centered retrieval.
-
-    1. Vector search finds relevant starting chunks.
-    2. Graph traversal expands those chunks.
-    3. Results are combined and deduplicated.
-    """
-
-    vector_docs = vector_search(
-        query,
-        k=vector_k,
-    )
-
-    vector_chunk_ids = [
-        doc.metadata.get("chunk_id")
-        for doc in vector_docs
-        if doc.metadata.get("chunk_id")
-    ]
-
-    graph_docs = graph_expand(
-        vector_chunk_ids,
-        limit=graph_k,
-    )
-
-    combined_docs = []
-
-    seen_chunk_ids = set()
-
-    for doc in vector_docs + graph_docs:
-
-        chunk_id = doc.metadata.get(
-            "chunk_id"
-        )
-
-        if chunk_id in seen_chunk_ids:
-            continue
-
-        seen_chunk_ids.add(chunk_id)
-
-        combined_docs.append(doc)
-
-    return combined_docs
-
-
-if __name__ == "__main__":
-
-    question = input(
-        "\nEnter a question: "
-    ).strip()
-
-    docs = neo4j_retrieve(
-        question,
-        vector_k=4,
-        graph_k=4,
-    )
-
-    print(
-        f"\nRetrieved {len(docs)} unique chunks.\n"
-    )
-
-    for i, doc in enumerate(
-        docs,
-        1,
-    ):
-
-        print(
-            f"--- Result {i} ---"
-        )
-
-        print(
-            f"Retrieval: "
-            f"{doc.metadata.get('retrieval')}"
-        )
-
-        print(
-            f"Chunk ID: "
-            f"{doc.metadata.get('chunk_id')}"
-        )
-
-        print(
-            f"Page: "
-            f"{doc.metadata.get('page')}"
-        )
-
-        if doc.metadata.get("similarity") is not None:
-
-            print(
-                f"Similarity: "
-                f"{doc.metadata.get('similarity'):.4f}"
+            expanded_documents.append(
+                Document(
+                    page_content=text,
+                    metadata=metadata,
+                )
             )
 
-        if doc.metadata.get("concept"):
+            seen_texts.add(text)
 
-            print(
-                f"Concepts: "
-                f"{doc.metadata.get('concept')}"
-            )
+    return expanded_documents
 
-        print()
 
-        print(
-            doc.page_content[:500]
-        )
+def neo4j_retrieve(query: str, k: int = 4) -> list[Document]:
+    """Retrieve relevant chunks and expand them through the graph."""
 
-        print()
+    documents = vector_search(query, k=k)
+    return graph_expand(documents)
+
